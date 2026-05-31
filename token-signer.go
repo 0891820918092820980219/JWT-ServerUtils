@@ -1,15 +1,5 @@
 package main
 
-//I am well aware that this needs a lot of cleaning up, just finished port from bash to go. 
-
-//Need to fix logging to be to console output only and not poison JSON response to API. 
-//right now this portion is a mess and this should not be used in production as API responses would give away too much error detail
-// A few tweaks of returned values and validation will fix this easy.
-
-
-//secrets are not going to be hardcoded in plain text files long term. going to containerise soon, will use docker/kuber env vars.
-//it is worth considering that this is not the ingress point and this app is not accessible to nginx/www-data at all
-
 import (
 	"crypto"
 	"crypto/hmac"
@@ -33,6 +23,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 )
+
+var rsaKey *rsa.PrivateKey
 
 const (
 	tmpPath     = "/opt/token-service/tmp/WORK-cert.pub"
@@ -69,6 +61,8 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, statusResponse{Status: msg})
 }
 
+
+
 func signJWT(payload string, rsaKey *rsa.PrivateKey) (string, error) {
 	b64url := func(data []byte) string {
 		return base64.RawURLEncoding.EncodeToString(data)
@@ -85,7 +79,7 @@ func signJWT(payload string, rsaKey *rsa.PrivateKey) (string, error) {
 	}
 	return data + "." + b64url(sig), nil
 }
-
+//going to make this declare global var at start of main, since changing to http server with concurrency, it is wasteful to load hmac from disk every time.
 func loadHMACSecret() (string, error) {
 	b, err := os.ReadFile("/opt/token-service/hmac_secret.txt")
 	if err != nil {
@@ -94,12 +88,14 @@ func loadHMACSecret() (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
+
 func computeHMACToken(secret, aud string) string {
 	h := hmac.New(sha256.New, []byte(secret))
 	_, _ = h.Write([]byte(aud))
 	return hex.EncodeToString(h.Sum(nil))
 }
-//going to make this also verify before returning decoded payload
+
+
 func verifyToken(encoded string) ([]byte, error) {
 	//splits JWT into 3 parts and takes second section which is payload.
 	parts := strings.Split(encoded, ".")
@@ -252,8 +248,13 @@ func InstallCertOnRunner(runnerName string) error {
 	return nil
 }
 
+
+
 // handleRequest signs a JWT from the incoming payload.
 func handleRequest(w http.ResponseWriter, r *http.Request) {
+
+
+
 	if r.Method != http.MethodPost {
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -268,31 +269,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	var req TokenJSON
 	if err := json.Unmarshal(body, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-
-	privKeyData, err := os.ReadFile(privKeyPath)
-	if err != nil {
-		log.Printf("ERROR reading private key: %v", err)
-		errJSON(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	block, _ := pem.Decode(privKeyData)
-	if block == nil || block.Type != "PRIVATE KEY" {
-		log.Println("ERROR: failed to decode PEM block")
-		errJSON(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		log.Printf("ERROR parsing private key: %v", err)
-		errJSON(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	rsaKey, ok := key.(*rsa.PrivateKey)
-	if !ok {
-		log.Println("ERROR: not an RSA private key")
-		errJSON(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -315,15 +291,22 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, token)
 }
 
+
+
 // handleCert validates an SSH JWT and issues a signed SSH certificate.
 func handleCert(w http.ResponseWriter, r *http.Request) {
+
+
+
 	if r.Method != http.MethodPost {
+		slog.Warn("Request dropped as was not POST method")
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		slog.Warn("Failed to ready body of POST request. Dropped.")
 		errJSON(w, http.StatusBadRequest, "failed to read body")
 		return
 	}
@@ -361,6 +344,32 @@ func handleCert(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+
+	//loading RSA key
+		privKeyData, err := os.ReadFile(privKeyPath)
+	if err != nil {
+		log.Printf("ERROR reading private key: %v", err)
+		return
+	}
+	block, _ := pem.Decode(privKeyData)
+	if block == nil || block.Type != "PRIVATE KEY" {
+		log.Println("ERROR: failed to decode PEM block")
+		return
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		log.Printf("ERROR parsing private key: %v", err)
+		return
+	}
+	var ok bool
+	rsaKey, ok = key.(*rsa.PrivateKey)
+	if !ok {
+		log.Println("ERROR: not an RSA private key")
+		return
+	}
+
+	//http server
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/request", handleRequest)
 	mux.HandleFunc("/cert", handleCert)
