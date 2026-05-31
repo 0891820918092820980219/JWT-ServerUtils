@@ -18,6 +18,9 @@ import (
         "regexp"
         "strings"
         "time"
+        "crypto/hmac"
+        "crypto/sha256"
+        "encoding/hex"
 
         _ "github.com/lib/pq"
 )
@@ -32,8 +35,8 @@ var (
 
 
         //SSH CERT
-    //    reData  = regexp.MustCompile(`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`)
-     //   reAuth    = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
+        reData  = regexp.MustCompile(`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`)
+        reAuth    = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 
 
 
@@ -64,6 +67,19 @@ func main() {
         }
 }
 
+
+func assignReqID () string {
+
+	reqID, err := randomHex(6)
+	if err != nil {
+		slog.Warn("Random hex failed, will return template req ID")
+		return "000000"
+	} 
+	slog.Info("New request with ID:", "req_id", reqID)
+	return reqID
+}
+
+
 //SSH Handler
 
 func sshHandler(w http.ResponseWriter, r *http.Request) {
@@ -75,15 +91,17 @@ func sshHandler(w http.ResponseWriter, r *http.Request) {
 
         w.Header().Set("Content-Type", "application/json")
 
+        reqID := assignReqID()
+
         if r.Method != http.MethodPost {
-                slog.Warn("method not allowed", "ip", srcIP)
+                slog.Warn("method not allowed", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusMethodNotAllowed, "POST only")
                 return
         }
 
         body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
         if err != nil || len(body) == 0 {
-                slog.Error("empty body", "ip", srcIP)
+                slog.Error("empty body", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusBadRequest, "empty body")
                 return
         }
@@ -98,13 +116,15 @@ func sshHandler(w http.ResponseWriter, r *http.Request) {
 
         
         if err := json.Unmarshal(body, &req); err != nil || req.Action == "" || req.Aud == "" || req.Data == "" || req.Auth == "" {
+                slog.Warn("empty fields presented", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusBadRequest, "empty fields")
                 return
         }
         //need regex validation
 
 //|| reData.MatchString(req.Data) || reAuth.MatchString(req.Auth)
-        if !reAction.MatchString(req.Action) || !reAud.MatchString(req.Aud)  {
+        if !reAction.MatchString(req.Action) || !reAud.MatchString(req.Aud) || !reData.MatchString(req.Data) || !reAuth.MatchString(req.Auth) {
+                slog.Warn("Regex check failed on presented payload", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusBadRequest, "invalid data")
                 return
         }
@@ -141,7 +161,11 @@ func sshHandler(w http.ResponseWriter, r *http.Request) {
         }
 
 
-
+func computeHMACToken(secret, scope string) string {
+	h := hmac.New(sha256.New, []byte(secret))
+	_, _ = h.Write([]byte(scope))
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 func handler(w http.ResponseWriter, r *http.Request) {
         srcIP := r.Header.Get("X-Real-IP")
@@ -153,18 +177,23 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
         w.Header().Set("Content-Type", "application/json")
 
+        reqID := assignReqID()
+
         if r.Method != http.MethodPost {
-                slog.Warn("method not allowed", "ip", srcIP)
+                slog.Warn("method not allowed", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusMethodNotAllowed, "POST only")
                 return
         }
 
         body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
         if err != nil || len(body) == 0 {
-                slog.Error("empty body", "ip", srcIP)
+                slog.Error("empty body", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusBadRequest, "empty body")
                 return
         }
+
+
+
 
         var req struct {
                 Action string `json:"action"`
@@ -172,14 +201,35 @@ func handler(w http.ResponseWriter, r *http.Request) {
                 Aud    string `json:"aud"`
         }
         if err := json.Unmarshal(body, &req); err != nil || req.Action == "" || req.Scope == "" || req.Aud == "" {
+                slog.Warn("Empty fields provided", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusBadRequest, "action, scope and audience required")
                 return
         }
 
         if !reAction.MatchString(req.Action) || !reScope.MatchString(req.Scope) || !reAud.MatchString(req.Aud) {
+                slog.Warn("Regex failure", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusBadRequest, "invalid data")
                 return
         }
+
+        //expectedHMACHeader is scope x secret
+        receivedHMACHeader := r.Header.Get("X-HMAC")
+
+        if receivedHMACHeader == "" {
+                slog.Warn("No HMAC header supplied", "ip", srcIP, "req_id", reqID)
+                jsonErr(w, http.StatusBadRequest, "unauthorised")
+                return
+        }
+
+        expectedHMACHeader := computeHMACToken("12345", req.Scope)
+
+        if expectedHMACHeader != receivedHMACHeader {
+                slog.Warn("HMAC Header supplied, but invalid", "ip", srcIP, "req_id", reqID)
+                jsonErr(w, http.StatusBadRequest, "unauthorised")
+                return
+        }
+
+        slog.Info("HMAC authorised, continuing", "ip", srcIP, "req_id", reqID)
 
         // Lookup host by fingerprint + permissions
         var hostID string
@@ -197,7 +247,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
         ).Scan(&hostID)
 
         if err == sql.ErrNoRows {
-                slog.Warn("unauthorised", "ip", srcIP, "fingerprint", tlsFingerprint)
+                slog.Warn("unauthorised", "ip", srcIP, "fingerprint", tlsFingerprint, "req_id", reqID)
                 jsonErr(w, http.StatusForbidden, "unauthorised")
                 return
         }
@@ -269,8 +319,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
         if result == 1 {
                 w.WriteHeader(http.StatusOK)
+                slog.Info("Token dispensed for", "ip", srcIP, "req_id", reqID)
                 fmt.Fprintf(w, `{"TOKEN":%q}`, jwt)
         } else {
+                slog.Warn("Token already exists, not dispensed for", "ip", srcIP, "req_id", reqID)
                 jsonErr(w, http.StatusForbidden, "token already exists")
         }
 }
